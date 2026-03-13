@@ -8,7 +8,7 @@ const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 // Test helper
 function test(name, fn) {
@@ -96,6 +96,44 @@ function createTestDir() {
 // Clean up test directory
 function cleanupTestDir(testDir) {
   fs.rmSync(testDir, { recursive: true, force: true });
+}
+
+function normalizeComparablePath(targetPath) {
+  if (!targetPath) return '';
+
+  let normalizedPath = String(targetPath).trim().replace(/\\/g, '/');
+
+  if (/^\/[a-zA-Z]\//.test(normalizedPath)) {
+    normalizedPath = `${normalizedPath[1]}:/${normalizedPath.slice(3)}`;
+  }
+
+  if (/^[a-zA-Z]:\//.test(normalizedPath)) {
+    normalizedPath = `${normalizedPath[0].toUpperCase()}:${normalizedPath.slice(2)}`;
+  }
+
+  try {
+    normalizedPath = fs.realpathSync(normalizedPath);
+  } catch {
+    // Fall through to string normalization when the path cannot be resolved directly.
+  }
+
+  return path.normalize(normalizedPath).replace(/\\/g, '/').replace(/^([a-z]):/, (_, drive) => `${drive.toUpperCase()}:`);
+}
+
+function pathsReferToSameLocation(leftPath, rightPath) {
+  const normalizedLeftPath = normalizeComparablePath(leftPath);
+  const normalizedRightPath = normalizeComparablePath(rightPath);
+
+  if (!normalizedLeftPath || !normalizedRightPath) return false;
+  if (normalizedLeftPath === normalizedRightPath) return true;
+
+  try {
+    const leftStats = fs.statSync(normalizedLeftPath);
+    const rightStats = fs.statSync(normalizedRightPath);
+    return leftStats.dev === rightStats.dev && leftStats.ino === rightStats.ino;
+  } catch {
+    return false;
+  }
 }
 
 function createCommandShim(binDir, baseName, logFile) {
@@ -2143,6 +2181,75 @@ async function runTests() {
 
       assert.strictEqual(code, 0, `detect-project.sh should source cleanly, stderr: ${stderr}`);
       assert.ok(stdout.trim().length > 0, 'CLV2_PYTHON_CMD should export a resolved interpreter path');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    await asyncTest('detect-project writes project metadata to the registry and project directory', async () => {
+      const testRoot = createTestDir();
+      const homeDir = path.join(testRoot, 'home');
+      const repoDir = path.join(testRoot, 'repo');
+      const detectProjectPath = path.join(__dirname, '..', '..', 'skills', 'continuous-learning-v2', 'scripts', 'detect-project.sh');
+
+      try {
+        fs.mkdirSync(homeDir, { recursive: true });
+        fs.mkdirSync(repoDir, { recursive: true });
+        spawnSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+        spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/example/ecc-test.git'], { cwd: repoDir, stdio: 'ignore' });
+
+        const shellCommand = [
+          `cd "${repoDir}"`,
+          `source "${detectProjectPath}" >/dev/null 2>&1`,
+          'printf "%s\\n" "$PROJECT_ID"',
+          'printf "%s\\n" "$PROJECT_DIR"'
+        ].join('; ');
+
+        const proc = spawn('bash', ['-lc', shellCommand], {
+          env: { ...process.env, HOME: homeDir },
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', data => (stdout += data));
+        proc.stderr.on('data', data => (stderr += data));
+
+        const code = await new Promise((resolve, reject) => {
+          proc.on('close', resolve);
+          proc.on('error', reject);
+        });
+
+        assert.strictEqual(code, 0, `detect-project should source cleanly, stderr: ${stderr}`);
+
+        const [projectId] = stdout.trim().split(/\r?\n/);
+        const registryPath = path.join(homeDir, '.claude', 'homunculus', 'projects.json');
+        const projectMetadataPath = path.join(homeDir, '.claude', 'homunculus', 'projects', projectId, 'project.json');
+
+        assert.ok(projectId, 'detect-project should emit a project id');
+        assert.ok(fs.existsSync(registryPath), 'projects.json should be created');
+        assert.ok(fs.existsSync(projectMetadataPath), 'project.json should be written in the project directory');
+
+        const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+        const metadata = JSON.parse(fs.readFileSync(projectMetadataPath, 'utf8'));
+
+        assert.ok(registry[projectId], 'registry should contain the detected project');
+        assert.strictEqual(metadata.id, projectId, 'project.json should include the detected id');
+        assert.strictEqual(metadata.name, path.basename(repoDir), 'project.json should include the repo name');
+        const normalizedMetadataRoot = normalizeComparablePath(metadata.root);
+        const normalizedRepoDir = normalizeComparablePath(repoDir);
+        assert.ok(normalizedMetadataRoot, 'project.json should include a non-empty repo root');
+        assert.ok(
+          pathsReferToSameLocation(normalizedMetadataRoot, normalizedRepoDir),
+          `project.json should include the repo root (expected ${normalizedRepoDir}, got ${normalizedMetadataRoot})`,
+        );
+        assert.strictEqual(metadata.remote, 'https://github.com/example/ecc-test.git', 'project.json should include the sanitized remote');
+        assert.ok(metadata.created_at, 'project.json should include created_at');
+        assert.ok(metadata.last_seen, 'project.json should include last_seen');
+      } finally {
+        cleanupTestDir(testRoot);
+      }
     })
   )
     passed++;
